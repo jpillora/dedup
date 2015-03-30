@@ -34,6 +34,8 @@ $ dedup --help
 	Options:
 	  --keep, keep duplicates (by default, duplicates are deleted)
 	  -v, verbose logs (display each move and delete)
+	  --version, display version
+	  -h --help, this help text
 
 	Notes:
 	  * dedup considers two files duplicates if they have
@@ -43,11 +45,10 @@ $ dedup --help
 	  * dedup on a single directory will only perform
 	    deduplication, no moves
 	  * dedup renames: when a file is unique, dedup will
-	    attempt to move
-	    the file. if the path already exists the incoming
-	    file will be suffixed with the next number (for
-	    example, if 'foo.txt' exists, the new file will
-	    be 'foo-2.txt')
+	    attempt to move the file. if the path already
+	    exists the incoming file will be suffixed with
+	    the next number (for example, if 'foo.txt' exists,
+	    the new file will be 'foo-2.txt')
 	  * any error will cause dedup to exit
 
 	Read more: https://github.com/jpillora/dedup
