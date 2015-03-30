@@ -1,6 +1,6 @@
-# dedeup
+# Dedup
 
-Deduplicate files
+Dedup is a command-line tool which de-deduplicates all provided directories by merging all into the first. The merge operation simultaneously removes duplicates and renames files due to path collisions.
 
 ### Install
 
@@ -24,24 +24,30 @@ $ dedup --help
 ```
 
 	Usage: dedup [options] <dir> [dir] [dir]
+	
+	Version: 0.0.0-src
 
-	Dedup de-deduplicates all directories, combines all dirs into
-	the first <dir>, while removing duplicates.
-
-	If two files having matching paths, the second file will be
-	prefixed to the filename (if 'foo.txt' exists, the new file
-	will be 'foo-2.txt').
-
-	If you only specify one <dir> then only dedeplication will be
-	performed.
+	Dedup de-deduplicates all provided directories by merging
+	all into the first. The merge operation simultaneously
+	removes duplicates and renames files due to path collisions.
 	
 	Options:
 	  --keep, keep duplicates (by default, duplicates are deleted)
-	  -v, verbose logs (display moves and deletes)
+	  -v, verbose logs (display each move and delete)
 
-	Warnings:
-	  * dedup is not recursive
+	Notes:
+	  * dedup considers two files duplicates if they have
+	    matching sha1 sums
+	  * dedup is not recursive (only works on files)
 	  * dedup is a destructive operation (unless --keep)
+	  * dedup on a single directory will only perform
+	    deduplication, no moves
+	  * dedup renames: when a file is unique, dedup will
+	    attempt to move
+	    the file. if the path already exists the incoming
+	    file will be suffixed with the next number (for
+	    example, if 'foo.txt' exists, the new file will
+	    be 'foo-2.txt')
 	  * any error will cause dedup to exit
 
 	Read more: https://github.com/jpillora/dedup
