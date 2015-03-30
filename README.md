@@ -56,6 +56,38 @@ $ dedup --help
 ```
 </tmpl>
 
+### Example
+
+``` sh
+$ cd example/
+$ tree .
+.
+├── bar
+│   ├── bar.txt
+│   ├── foo-copy.txt
+│   └── foo.txt
+└── foo
+    ├── bazz.txt
+    └── foo.txt
+
+2 directories, 5 files
+
+$ dedup foo bar
+Indexing 'foo' (#2 files)
+Merging in 'bar' (#3 files)
+Done (moves 1 deletes 2)
+
+$ tree .
+.
+├── bar
+└── foo
+    ├── bar.txt
+    ├── bazz.txt
+    └── foo.txt
+
+2 directories, 3 files
+```
+
 #### MIT License
 
 Copyright © 2015 Jaime Pillora &lt;dev@jpillora.com&gt;
