@@ -22,12 +22,14 @@ var help = `
 	
 	Version: ` + VERSION + `
 
-	Dedup de-deduplicates all provided directories by merging
-	all into the first. The merge operation simultaneously
-	removes duplicates and renames files due to path collisions.
+	deduplicates all files in the provided directories
+	by merging them together into the first directory.
+	The merge operation simultaneously removes duplicates
+	and renames files (when a path collision occurs).
 	
 	Options:
-	  --keep, keep duplicates (by default, duplicates are deleted)
+	  --keep, keep duplicates (by default, duplicates
+	    are deleted)
 	  -v, verbose logs (display each move and delete)
 	  --version, display version
 	  -h --help, this help text
