@@ -8,44 +8,72 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 )
 
 const help = `
-	Usage: dedup <destination> [source] [source]
+	Usage: dedup [options] <dir> [dir] [dir]
 
-	Dedup indexes and removes all duplicates from <destination> and
-	then merges in all files from each [source] while deleting duplicates.
-	If files are different, though they have the same name, a number will
-	be prefixed to the filename (if 'foo.txt' exists, the new file will
-	be 'foo-2.txt'). If you only specify a <destination> then only de-
-	deplication will be performed.
+	Dedup de-deduplicates all directories, combines all dirs into
+	the first <dir>, while removing duplicates.
+
+	If two files having matching paths, the second file will be
+	prefixed to the filename (if 'foo.txt' exists, the new file
+	will be 'foo-2.txt').
+
+	If you only specify one <dir> then only dedeplication will be
+	performed.
 	
+	Options:
+	  --keep, keep duplicates (by default, duplicates are deleted)
+	  -v, verbose logs (display moves and deletes)
+
+	Warnings:
+	  * dedup is not recursive
+	  * dedup is a destructive operation (unless --keep)
+	  * any error will cause dedup to exit
+
 	Read more: https://github.com/jpillora/dedup
 
 `
 
+var (
+	mut = &sync.Mutex{}
+	//mut guards these 3 vars
+	deletes = 0
+	moves   = 0
+	hashes  = map[string]string{}
+)
+
+func report() string {
+	return fmt.Sprintf("moves %d deletes %d", moves, deletes)
+}
+
 func main() {
 	h1 := flag.Bool("h", false, "")
 	h2 := flag.Bool("help", false, "")
+	verbose := flag.Bool("v", false, "")
+	keep := flag.Bool("keep", false, "")
+	flag.Usage = func() {
+		fmt.Fprint(os.Stderr, help)
+		os.Exit(1)
+	}
 	flag.Parse()
 
 	if *h1 || *h2 {
-		fmt.Fprint(os.Stderr, help)
-		os.Exit(1)
+		flag.Usage()
 	}
 
 	args := flag.Args()
 	if len(args) < 1 {
-		check(errors.New("Missing destination"))
+		flag.Usage()
 	}
 
 	dst := args[0]
-	srcs := args[1:]
-
 	info, err := os.Stat(dst)
 	check(err)
 
@@ -53,50 +81,77 @@ func main() {
 		check(errors.New("Must be directory"))
 	}
 
+	//========================
+
+	//use all da cpus
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
 	files, err := ioutil.ReadDir(dst)
 	check(err)
 
-	hashes := map[string]string{}
-
 	//initialize index
 	fmt.Printf("Indexing '%s' (#%d files)\n", dst, len(files))
-	for _, f := range files {
+
+	each(files, func(f os.FileInfo) {
 		n := f.Name()
 		if f.IsDir() || strings.HasPrefix(filepath.Base(n), ".") {
-			continue //skip hidden
+			return //skip hidden
 		}
 		dstpath := filepath.Join(dst, n)
 		hex := hash(dstpath)
+		//guard hashes index
+		mut.Lock()
+		defer mut.Unlock()
+		//look at index
 		if other, exists := hashes[hex]; exists {
-			fmt.Printf("  Duplicate '%s' of '%s'\n", n, other)
-			err := os.Remove(dstpath)
-			check(err)
-			continue
+			if !*keep {
+				if *verbose {
+					fmt.Printf("  Remove duplicate '%s' (of '%s')\n", n, other)
+				}
+				err := os.Remove(dstpath)
+				check(err)
+				deletes++
+			}
+			return
 		}
 		hashes[hex] = n
-		fmt.Printf("  Indexed '%s' (%s)\n", n, hex)
-	}
+		if *verbose {
+			fmt.Printf("  Indexed '%s' (%s)\n", n, hex)
+		}
+	})
 
+	srcs := args[1:]
 	//compare others against index
 	for _, src := range srcs {
 		files, err := ioutil.ReadDir(src)
 		check(err)
 
-		fmt.Printf("Merging %s (#%d files)\n", src, len(files))
-		for _, f := range files {
+		fmt.Printf("Merging in '%s' (#%d files)\n", src, len(files))
+		each(files, func(f os.FileInfo) {
 			n := f.Name()
 			if f.IsDir() || strings.HasPrefix(filepath.Base(n), ".") {
-				continue
+				return
 			}
 			srcpath := filepath.Join(src, n)
-			_, exists := hashes[hash(srcpath)]
+			hex := hash(srcpath)
+			//guard hashes index
+			mut.Lock()
+			defer mut.Unlock()
+			//look at index
+			_, exists := hashes[hex]
 			if exists {
-				fmt.Printf("  Remove duplicate: %s\n", n)
-				err := os.Remove(srcpath)
-				check(err)
-				//delete?
-				continue
+				if !*keep {
+					if *verbose {
+						fmt.Printf("  Remove duplicate: %s\n", n)
+					}
+					err := os.Remove(srcpath)
+					check(err)
+					deletes++
+				}
+				return
 			}
+			//mark as exists
+			hashes[hex] = n
 			//find next availbe file name
 			dstpath := filepath.Join(dst, n)
 			i := 1
@@ -106,22 +161,51 @@ func main() {
 				}
 				i++
 				ext := filepath.Ext(n)
-				base := strings.TrimSuffix(n, ext)
-				newname := fmt.Sprintf("%s-%d%s", base, i, ext)
+				name := strings.TrimSuffix(n, ext)
+				newname := fmt.Sprintf("%s-%d%s", name, i, ext)
 				dstpath = filepath.Join(dst, newname)
 			}
 			//missing, move in
-			fmt.Printf("  Moving: %s -> %s\n", n, dstpath)
-			err = os.Rename(srcpath, dstpath)
-			if err != nil {
-				log.Fatal(err)
+			if *verbose {
+				fmt.Printf("  Moving: %s -> %s\n", n, dstpath)
 			}
-		}
+			err = os.Rename(srcpath, dstpath)
+			check(err)
+			moves++
+		})
 	}
 
-	fmt.Printf("Done\n")
+	fmt.Printf("Done (%s)\n", report())
 }
 
+//fan-out for-each over fileinfos
+func each(files []os.FileInfo, fn func(os.FileInfo)) {
+	queue := make(chan os.FileInfo)
+	wg := &sync.WaitGroup{}
+	// the work operation
+	work := func() {
+		defer wg.Done()
+		for f := range queue {
+			fn(f)
+		}
+	}
+	// add #CPU many workers and start all
+	for i := 0; i < runtime.NumCPU(); i++ {
+		wg.Add(1)
+		go work()
+	}
+	// queue all work
+	for _, f := range files {
+		queue <- f
+	}
+	//all items queued, mark end
+	close(queue)
+	//will only yield once all workers
+	//have completed their task
+	wg.Wait()
+}
+
+//hash the file at path to an sha1 hex string
 func hash(p string) string {
 	f, err := os.Open(p)
 	check(err)
@@ -130,9 +214,10 @@ func hash(p string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+//halt program if error is encountered
 func check(err error) {
 	if err != nil {
-		fmt.Printf("Error: %s\n", err)
+		fmt.Fprintf(os.Stderr, "Error: %s (%s)\n", err, report())
 		os.Exit(1)
 	}
 }
