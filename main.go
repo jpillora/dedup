@@ -111,7 +111,7 @@ func main() {
 
 	each(files, func(f os.FileInfo) {
 		n := f.Name()
-		if f.IsDir() || strings.HasPrefix(filepath.Base(n), ".") {
+		if !f.Mode().IsRegular() || strings.HasPrefix(filepath.Base(n), ".") {
 			return //skip hidden
 		}
 		dstpath := filepath.Join(dst, n)
@@ -146,7 +146,7 @@ func main() {
 		fmt.Printf("Merging in '%s' (#%d files)\n", src, len(files))
 		each(files, func(f os.FileInfo) {
 			n := f.Name()
-			if f.IsDir() || strings.HasPrefix(filepath.Base(n), ".") {
+			if !f.Mode().IsRegular() || strings.HasPrefix(filepath.Base(n), ".") {
 				return
 			}
 			srcpath := filepath.Join(src, n)
