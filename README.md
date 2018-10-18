@@ -6,11 +6,13 @@ Dedup is a command-line tool which deduplicates all files in the provided direct
 
 **Binaries**
 
-See [Releases](https://github.com/jpillora/dedup/releases/latest)
+[![Releases](https://img.shields.io/github/release/jpillora/dedup.svg)](https://github.com/jpillora/dedup/releases) [![Releases](https://img.shields.io/github/downloads/jpillora/dedup/total.svg)](https://github.com/jpillora/dedup/releases)
+
+See [the latest release](https://github.com/jpillora/dedup/releases/latest) or download and install it now with `curl https://i.jpillora.com/dedup! | bash`
 
 **Source**
 
-``` sh
+```sh
 $ go get -v github.com/jpillora/dedup
 ```
 
@@ -18,49 +20,45 @@ $ go get -v github.com/jpillora/dedup
 
 ```
 $ dedup --help
+
+  Usage: dedup [options] directories...
+
+  deduplicates all files in the provided directories, while optionally merging
+  them into the first directory. The merge operation renames files (when a path
+  collision occurs).
+
+  Options:
+  --keep, -k       keep duplicates (by default, duplicates are deleted)
+  --merge, -m      move unique files into the first directory
+  --recursive, -r  searches into nested directories
+  --verbose, -v    verbose logs (displays each move and delete)
+  --dryrun, -d     runs exactly as configured, except no changes are made
+  --workers, -w    number of worker threads (default 4)
+  --hash, -h       hashing algorithm to use (default md5, can also choose
+                   sha1 and sha256)
+  --help
+  --version
+
+  Notes:
+  * dedup considers two files duplicates if they have matching hash sums.
+  * dedup is a destructive operation (unless --keep).
+  * dedup on a single directory will only perform deduplication, no moves.
+  * dedup renames: when a file is unique, dedup will attempt to move the file.
+    if the path already exists the incoming file will be suffixed with the next
+    number (for example, if 'foo.txt' exists, the new file will be 'foo-2.txt').
+  * enabling 'keep' without 'merge' enabled is a no-op.
+  * any error will cause dedup to exit.
+
+  Version:
+    0.0.0-src
+
+  Read more:
+    github.com/jpillora/dedup
 ```
-
-<tmpl,code: go run main.go --help>
-```
-
-	Usage: dedup [options] <dir> [dir] [dir]
-	
-	Version: 0.0.0-src
-
-	deduplicates all files in the provided directories
-	by merging them together into the first directory.
-	The merge operation simultaneously removes duplicates
-	and renames files (when a path collision occurs).
-	
-	Options:
-	  --keep, keep duplicates (by default, duplicates
-	    are deleted)
-	  -v, verbose logs (display each move and delete)
-	  --version, display version
-	  -h --help, this help text
-
-	Notes:
-	  * dedup considers two files duplicates if they have
-	    matching sha1 sums
-	  * dedup is not recursive (only works on files)
-	  * dedup is a destructive operation (unless --keep)
-	  * dedup on a single directory will only perform
-	    deduplication, no moves
-	  * dedup renames: when a file is unique, dedup will
-	    attempt to move the file. if the path already
-	    exists the incoming file will be suffixed with
-	    the next number (for example, if 'foo.txt' exists,
-	    the new file will be 'foo-2.txt')
-	  * any error will cause dedup to exit
-
-	Read more: https://github.com/jpillora/dedup
-
-```
-</tmpl>
 
 ### Example
 
-``` sh
+```sh
 $ cd example/
 $ tree .
 .
@@ -74,10 +72,18 @@ $ tree .
 
 2 directories, 5 files
 
-$ dedup foo bar
-Indexing 'foo' (#2 files)
-Merging in 'bar' (#3 files)
-Done (moves 1 deletes 2)
+$ dedup --verbose --dryrun --merge foo bar
+[DRYRUN] Scanning foo (no changes)
+[DRYRUN] Scanning bar (hashed 2)
+[DRYRUN] Removing bar/foo.txt dupe-of foo/foo.txt (hashed 3)
+[DRYRUN] Moving: bar/bar.txt -> foo/bar.txt (hashed 4)
+[DRYRUN] Removing bar/foo-copy.txt dupe-of foo/foo.txt (hashed 5, moved 1, deleted 1)
+[DRYRUN] Done (hashed 5, moved 1, deleted 2)
+
+# looks good!
+
+$ dedup --merge foo bar
+Done (hashed 5, moved 1, deleted 2)
 
 $ tree .
 .

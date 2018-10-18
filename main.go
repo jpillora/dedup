@@ -1,11 +1,13 @@
 package main
 
 import (
+	"crypto/md5"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"flag"
 	"fmt"
+	"hash"
 	"io"
 	"io/ioutil"
 	"os"
@@ -13,228 +15,386 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
+
+	"github.com/jpillora/ansi"
+	"github.com/jpillora/opts"
+	"golang.org/x/crypto/ssh/terminal"
 )
 
-var VERSION string = "0.0.0-src" //set via ldflags
-
-var help = `
-	Usage: dedup [options] <dir> [dir] [dir]
-	
-	Version: ` + VERSION + `
-
-	deduplicates all files in the provided directories
-	by merging them together into the first directory.
-	The merge operation simultaneously removes duplicates
-	and renames files (when a path collision occurs).
-	
-	Options:
-	  --keep, keep duplicates (by default, duplicates
-	    are deleted)
-	  -v, verbose logs (display each move and delete)
-	  --version, display version
-	  -h --help, this help text
-
-	Notes:
-	  * dedup considers two files duplicates if they have
-	    matching sha1 sums
-	  * dedup is not recursive (only works on files)
-	  * dedup is a destructive operation (unless --keep)
-	  * dedup on a single directory will only perform
-	    deduplication, no moves
-	  * dedup renames: when a file is unique, dedup will
-	    attempt to move the file. if the path already
-	    exists the incoming file will be suffixed with
-	    the next number (for example, if 'foo.txt' exists,
-	    the new file will be 'foo-2.txt')
-	  * any error will cause dedup to exit
-
-	Read more: https://github.com/jpillora/dedup
-
-`
+const Version = "0.0.0-src" //set via ldflags
 
 var (
-	mut = &sync.Mutex{}
-	//mut guards these 3 vars
-	deletes = 0
-	moves   = 0
-	hashes  = map[string]string{}
+	//config
+	config = struct {
+		Keep        bool     `help:"keep duplicates (by default, duplicates are deleted)"`
+		Merge       bool     `help:"move unique files into the first directory"`
+		Recursive   bool     `help:"searches into nested directories"`
+		Verbose     bool     `help:"verbose logs (displays each move and delete)"`
+		Dryrun      bool     `help:"runs exactly as configured, except no changes are made"`
+		Workers     int      `help:"number of worker threads"`
+		Hash        string   `help:"hashing algorithm to use" default:"md5, can also choose sha1 and sha256"`
+		Directories []string `type:"arg" min:"1"`
+	}{
+		Workers: runtime.NumCPU(),
+		Hash:    "md5",
+	}
+	//path separator
+	sep = string(filepath.Separator)
+	//indexMut guards index
+	indexMut = sync.Mutex{}
+	index    = map[string]string{}
+	//stats
+	hashed  = uint64(0)
+	deletes = uint64(0)
+	moves   = uint64(0)
 )
 
-func report() string {
-	return fmt.Sprintf("moves %d deletes %d", moves, deletes)
-}
+const summary = `
+deduplicates all files in the provided directories, while optionally merging
+them into the first directory. The merge operation renames files (when a path
+collision occurs).
+`
+
+const notes = `
+Notes:
+* dedup considers two files duplicates if they have matching hash sums.
+* dedup is a destructive operation (unless --keep).
+* dedup on a single directory will only perform deduplication, no moves.
+* dedup renames: when a file is unique, dedup will attempt to move the file.
+  if the path already exists the incoming file will be suffixed with the next
+  number (for example, if 'foo.txt' exists, the new file will be 'foo-2.txt').
+* enabling 'keep' without 'merge' enabled is a no-op.
+* any error will cause dedup to exit.
+`
 
 func main() {
-	h1 := flag.Bool("h", false, "")
-	h2 := flag.Bool("help", false, "")
-	verbose := flag.Bool("v", false, "")
-	version := flag.Bool("version", false, "")
-	keep := flag.Bool("keep", false, "")
-	flag.Usage = func() {
-		fmt.Fprint(os.Stderr, help)
-		os.Exit(1)
-	}
-	flag.Parse()
-
-	if *version {
-		fmt.Println(VERSION)
-		os.Exit(0)
-	}
-
-	if *h1 || *h2 {
-		flag.Usage()
-	}
-
-	args := flag.Args()
-	if len(args) < 1 {
-		flag.Usage()
-	}
-
-	dst := args[0]
-	info, err := os.Stat(dst)
-	check(err)
-
-	if !info.IsDir() {
-		check(errors.New("Must be directory"))
-	}
-
-	//========================
-
-	//use all da cpus
-	runtime.GOMAXPROCS(runtime.NumCPU())
-
-	files, err := ioutil.ReadDir(dst)
-	check(err)
-
-	//initialize index
-	fmt.Printf("Indexing '%s' (#%d files)\n", dst, len(files))
-
-	each(files, func(f os.FileInfo) {
-		n := f.Name()
-		if !f.Mode().IsRegular() || strings.HasPrefix(filepath.Base(n), ".") {
-			return //skip hidden
+	//cli
+	o := opts.New(&config)
+	o.DocBefore("options", "summary", summary)
+	o.DocAfter("options", "notes", notes)
+	o.Version(Version)
+	o.Repo("github.com/jpillora/dedup")
+	o.Parse()
+	//validate hash
+	switch config.Hash {
+	case "md5":
+		newHash = func() hash.Hash {
+			return md5.New()
 		}
-		dstpath := filepath.Join(dst, n)
-		hex := hash(dstpath)
-		//guard hashes index
-		mut.Lock()
-		defer mut.Unlock()
-		//look at index
-		if other, exists := hashes[hex]; exists {
-			if !*keep {
-				if *verbose {
-					fmt.Printf("  Remove duplicate '%s' (of '%s')\n", n, other)
+	case "sha1":
+		newHash = func() hash.Hash {
+			return sha1.New()
+		}
+	case "sha256":
+		newHash = func() hash.Hash {
+			return sha256.New()
+		}
+	default:
+		check(errors.New("Unknown hashing algorithm"))
+	}
+	//validate dirs
+	dirs := config.Directories
+	for i, d := range dirs {
+		d = strings.TrimSuffix(d, sep)
+		info, err := os.Stat(d)
+		check(err, "stat-input: "+d)
+		if !info.IsDir() {
+			check(errors.New("Must be directory"))
+		}
+		dirs[i] = d
+	}
+	//run!
+	dst := dirs[0]
+	for _, src := range dirs {
+		scan(dst, src, dirs)
+	}
+	//done!
+	printf("Done")
+}
+
+func scan(dst, src string, inputDirs []string) {
+	first := dst == src
+	noMerge := first || !config.Merge
+	queue := newQueue()
+	//dequeue until the queue is empty
+	queue.de(func(path string) {
+		info, err := os.Stat(path)
+		check(err, "stat-dequeue: "+path)
+		//directory? en all files
+		if info.IsDir() {
+			//ignore subdirs of path unless --recursive
+			if src != path && !config.Recursive {
+				return
+			}
+			//recurse!
+			if config.Verbose {
+				printf("Scanning %s", blue(display(path)))
+			}
+			files, err := ioutil.ReadDir(path)
+			check(err, "read-dir: "+path)
+			paths := []string{}
+			for _, info := range files {
+				p := filepath.Join(path, info.Name())
+				//if listed as another input dir,
+				//skip to provide control of process order.
+				isInput := false
+				for _, id := range inputDirs {
+					if src != id && p == id {
+						isInput = true
+					}
 				}
-				err := os.Remove(dstpath)
-				check(err)
-				deletes++
+				if isInput {
+					continue
+				}
+				//include!
+				paths = append(paths, p)
+			}
+			queue.en(paths)
+			return
+		}
+		//abnormal or hidden file? skip
+		if !info.Mode().IsRegular() || strings.HasPrefix(filepath.Base(path), ".") {
+			return
+		}
+		//normal file, hash!
+		hex := hashFile(path)
+		atomic.AddUint64(&hashed, 1)
+		//if already exists? delete!
+		indexMut.Lock()
+		existPath, exists := index[hex]
+		indexMut.Unlock()
+		if exists {
+			if path == existPath {
+				return //already scanned
+			}
+			if !config.Keep {
+				if config.Verbose {
+					t, del, exi := trimPathPrefix(path, existPath)
+					if t == "" {
+						printf("Removing %s dupe-of %s", red(del), blue(exi))
+					} else {
+						printf("Removing %s/{%s dupe-of %s}", grey(t), red(del), blue(exi))
+					}
+				}
+				if !config.Dryrun {
+					check(os.Remove(path))
+				}
+				atomic.AddUint64(&deletes, 1)
 			}
 			return
 		}
-		hashes[hex] = n
-		if *verbose {
-			fmt.Printf("  Indexed '%s' (%s)\n", n, hex)
+		//file is unqiue! place in the index
+		indexMut.Lock()
+		index[hex] = path
+		indexMut.Unlock()
+		//merge unique files into first directory?
+		if noMerge {
+			return
 		}
+		//find next availbe file name
+		name := info.Name()
+		dstpath := filepath.Join(dst, name)
+		n := 1
+		ext := filepath.Ext(name)
+		base := strings.TrimSuffix(name, ext)
+		for {
+			if _, err := os.Stat(dstpath); os.IsNotExist(err) {
+				break
+			}
+			n++
+			newname := fmt.Sprintf("%s-%d%s", base, n, ext)
+			dstpath = filepath.Join(dst, newname)
+		}
+		//missing, move in
+		if config.Verbose {
+			t, s, d := trimPathPrefix(path, dstpath)
+			if t == "" {
+				printf("Moving: %s -> %s", s, green(d))
+			} else {
+				printf("Moving: %s/{%s -> %s}", grey(t), s, green(d))
+			}
+		}
+		if !config.Dryrun {
+			check(os.Rename(path, dstpath))
+		}
+		atomic.AddUint64(&moves, 1)
 	})
-
-	srcs := args[1:]
-	//compare others against index
-	for _, src := range srcs {
-		files, err := ioutil.ReadDir(src)
-		check(err)
-
-		fmt.Printf("Merging in '%s' (#%d files)\n", src, len(files))
-		each(files, func(f os.FileInfo) {
-			n := f.Name()
-			if !f.Mode().IsRegular() || strings.HasPrefix(filepath.Base(n), ".") {
-				return
-			}
-			srcpath := filepath.Join(src, n)
-			hex := hash(srcpath)
-			//guard hashes index
-			mut.Lock()
-			defer mut.Unlock()
-			//look at index
-			_, exists := hashes[hex]
-			if exists {
-				if !*keep {
-					if *verbose {
-						fmt.Printf("  Remove duplicate: %s\n", n)
-					}
-					err := os.Remove(srcpath)
-					check(err)
-					deletes++
-				}
-				return
-			}
-			//mark as exists
-			hashes[hex] = n
-			//find next availbe file name
-			dstpath := filepath.Join(dst, n)
-			i := 1
-			for {
-				if _, err := os.Stat(dstpath); os.IsNotExist(err) {
-					break
-				}
-				i++
-				ext := filepath.Ext(n)
-				name := strings.TrimSuffix(n, ext)
-				newname := fmt.Sprintf("%s-%d%s", name, i, ext)
-				dstpath = filepath.Join(dst, newname)
-			}
-			//missing, move in
-			if *verbose {
-				fmt.Printf("  Moving: %s -> %s\n", n, dstpath)
-			}
-			err = os.Rename(srcpath, dstpath)
-			check(err)
-			moves++
-		})
-	}
-
-	fmt.Printf("Done (%s)\n", report())
+	//initial item
+	queue.en([]string{src})
+	//wait for queue to empty
+	queue.wait()
 }
 
-//fan-out for-each over fileinfos
-func each(files []os.FileInfo, fn func(os.FileInfo)) {
-	queue := make(chan os.FileInfo)
-	wg := &sync.WaitGroup{}
-	// the work operation
-	work := func() {
-		defer wg.Done()
-		for f := range queue {
-			fn(f)
-		}
+type queue struct {
+	wg     sync.WaitGroup
+	queue  chan string
+	closed bool
+	count  uint64
+	total  uint64
+}
+
+func newQueue() *queue {
+	return &queue{
+		queue: make(chan string),
 	}
-	// add #CPU many workers and start all
-	for i := 0; i < runtime.NumCPU(); i++ {
-		wg.Add(1)
+}
+
+func (p *queue) en(paths []string) {
+	atomic.AddUint64(&p.total, uint64(len(paths)))
+	go func() {
+		for _, path := range paths {
+			p.queue <- path
+		}
+	}()
+}
+
+func (p *queue) de(fn func(path string)) {
+	work := func() {
+		for f := range p.queue {
+			fn(f)
+			//bump up completed counter
+			atomic.AddUint64(&p.count, 1)
+			//close one there are no more items
+			count := atomic.LoadUint64(&p.count)
+			total := atomic.LoadUint64(&p.total)
+			if count == total {
+				close(p.queue)
+			}
+			if config.Verbose && count%100 == 0 {
+				printf(grey("Performed #%d actions with #%d queued"), count, total-count)
+			}
+		}
+		p.wg.Done()
+	}
+	for i := 0; i < config.Workers; i++ {
+		p.wg.Add(1)
 		go work()
 	}
-	// queue all work
-	for _, f := range files {
-		queue <- f
-	}
-	//all items queued, mark end
-	close(queue)
-	//will only yield once all workers
-	//have completed their task
-	wg.Wait()
 }
 
+func (p *queue) wait() {
+	p.wg.Wait()
+}
+
+func (p *queue) close() {
+	if !p.closed {
+		close(p.queue)
+		p.closed = true
+	}
+}
+
+var isaTTY = terminal.IsTerminal(int(os.Stdout.Fd()))
+
+func color(attr ansi.Attribute) func(string) string {
+	if !isaTTY {
+		return func(s string) string {
+			return s
+		}
+	}
+	col := string(ansi.Set(attr))
+	reset := string(ansi.ResetBytes)
+	return func(s string) string {
+		return col + s + reset
+	}
+}
+
+var grey = color(ansi.Black)
+var green = color(ansi.Green)
+var red = color(ansi.Red)
+var blue = color(ansi.Blue)
+
+func report() string {
+	parts := []string{}
+	h := atomic.LoadUint64(&hashed)
+	if h > 0 {
+		parts = append(parts, fmt.Sprintf("hashed %d", h))
+	}
+	m := atomic.LoadUint64(&moves)
+	if m > 0 {
+		parts = append(parts, fmt.Sprintf("moved %d", m))
+	}
+	d := atomic.LoadUint64(&deletes)
+	if d > 0 {
+		parts = append(parts, fmt.Sprintf("deleted %d", d))
+	}
+	if len(parts) == 0 {
+		return "no changes"
+	}
+	return strings.Join(parts, ", ")
+}
+
+var lastReport = ""
+
+func printf(format string, args ...interface{}) {
+	if config.Dryrun {
+		format = grey("[DRYRUN] ") + format
+	}
+	r := report()
+	if r != lastReport {
+		format += grey(" (" + r + ")")
+		lastReport = r
+	}
+	format += "\n"
+	fmt.Printf(format, args...)
+}
+
+type hashFactory func() hash.Hash
+
+var newHash hashFactory
+
 //hash the file at path to an sha1 hex string
-func hash(p string) string {
+func hashFile(p string) string {
 	f, err := os.Open(p)
-	check(err)
-	h := sha1.New()
+	check(err, p)
+	h := newHash()
 	io.Copy(h, f)
+	f.Close()
 	return hex.EncodeToString(h.Sum(nil))
 }
 
 //halt program if error is encountered
-func check(err error) {
+func check(err error, msg ...string) {
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %s (%s)\n", err, report())
+		format := "Error: %s"
+		if len(msg) > 0 {
+			format += " [" + strings.Join(msg, " ") + "]"
+		}
+		format += " (%s)"
+		fmt.Fprintf(os.Stderr, format, err, report())
 		os.Exit(1)
 	}
+}
+
+func display(path string) string {
+	return strings.Replace(path, " ", "·", -1)
+}
+
+func contains(set []string, item string) bool {
+	for _, s := range set {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
+func trimPathPrefix(pathA, pathB string) (string, string, string) {
+	partsT := []string{}
+	partsA := strings.Split(pathA, sep)
+	partsB := strings.Split(pathB, sep)
+	for len(partsA) > 0 && len(partsB) > 0 {
+		a := partsA[0]
+		b := partsB[0]
+		if a != b {
+			break
+		}
+		partsT = append(partsT, a)
+		partsA = partsA[1:]
+		partsB = partsB[1:]
+	}
+	pathTrimmed := strings.Join(partsT, sep)
+	pathA = strings.Join(partsA, sep)
+	pathB = strings.Join(partsB, sep)
+	return display(pathTrimmed), display(pathA), display(pathB)
 }
