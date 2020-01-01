@@ -22,7 +22,7 @@ import (
 	"golang.org/x/crypto/ssh/terminal"
 )
 
-const Version = "0.0.0-src" //set via ldflags
+const version = "0.0.0-src" //set via ldflags
 
 var (
 	//config
@@ -50,11 +50,9 @@ var (
 	moves   = uint64(0)
 )
 
-const summary = `
-deduplicates all files in the provided directories, while optionally merging
+const summary = `deduplicates all files in the provided directories, while optionally merging
 them into the first directory. The merge operation renames files (when a path
-collision occurs).
-`
+collision occurs).`
 
 const notes = `
 Notes:
@@ -64,16 +62,16 @@ Notes:
 * dedup renames: when a file is unique, dedup will attempt to move the file.
   if the path already exists the incoming file will be suffixed with the next
   number (for example, if 'foo.txt' exists, the new file will be 'foo-2.txt').
-* enabling 'keep' without 'merge' enabled is a no-op.
+* enabling --keep and not --merge is a read-only operation.
 * any error will cause dedup to exit.
 `
 
 func main() {
 	//cli
 	o := opts.New(&config)
-	o.DocBefore("options", "summary", summary)
-	o.DocAfter("options", "notes", notes)
-	o.Version(Version)
+	o.Summary(summary)
+	o.DocBefore("version", "notes", notes)
+	o.Version(version)
 	o.Repo("github.com/jpillora/dedup")
 	o.Parse()
 	//validate hash
